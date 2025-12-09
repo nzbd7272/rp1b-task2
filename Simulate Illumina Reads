@@ -1,0 +1,97 @@
+import subprocess
+import os
+import re # <--- REQUIRED FOR THE REGEX MATCHING
+
+# --- Function to get total genome length (Manual Parsing) ---
+def get_genome_length(fasta_path):
+    """Calculates the total length of all sequences in a FASTA file by counting sequence lines."""
+    total_length = 0
+    try:
+        with open(fasta_path, 'r') as f:
+            for line in f:
+                # Remove leading/trailing whitespace, including carriage returns
+                line = line.strip() 
+                
+                #only skip the header lines. Everything else is counted.
+                if line.startswith('>'):
+                    continue
+                
+                # Check for an empty line that might have been left over after stripping (had lots of issues with thinking that the files have nothing in them so had to do a lot to make sure that didn't happen)
+                if line:
+                    total_length += len(line)
+        return total_length
+    except Exception as e:
+        print(f"DEBUG ERROR (Simplified): Failed to open or read {fasta_path}. Error: {e}")
+        return 0
+
+# -------------------------------------------------------------------
+
+# --- Configuration ---
+READ_LENGTH = 100
+COVERAGE = 30     
+ERROR_RATE = 0.0  
+
+# Directory setup
+GENOME_DIR = "mutated_genomes"
+OUTPUT_DIR = "simulated_reads"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+genome_files = [f for f in os.listdir(GENOME_DIR) if f.endswith(('.fasta', '.fa', '.fna'))]
+
+# --- Simulation Loop ---
+for genome_file in genome_files:
+    input_path = os.path.join(GENOME_DIR, genome_file)
+    base_name = os.path.splitext(genome_file)[0]
+    output_fastq_r1 = os.path.join(OUTPUT_DIR, f"{base_name}_R1.fastq")
+    output_fastq_r2 = os.path.join(OUTPUT_DIR, f"{base_name}_R2.fastq")
+
+    # 1. Get Genome Length
+    genome_length = get_genome_length(input_path)
+
+    if genome_length == 0:
+        # If the genome_length is 0, the error is likely a problem with the file content/format 
+        print(f"Skipping {genome_file}: Genome length is zero or file could not be read.")
+        continue
+
+    # 2. Calculate Required Number of Read Pairs (N)
+    # N = (Coverage * Genome Length) / (2 * Read Length)
+    required_read_pairs = (COVERAGE * genome_length) // (2 * READ_LENGTH)
+    
+    if required_read_pairs == 0:
+        required_read_pairs = 100
+
+    print(f"Genome length: {genome_length} bp. Calculating {required_read_pairs} paired reads for {COVERAGE}x coverage...")
+
+    # Set the full path to wgsim
+    FULL_WG_SIM_PATH = "/shared/team/conda/nzbd20.workshopzi/varcall/bin/wgsim"
+    
+    wgsim_command = [
+        FULL_WG_SIM_PATH,
+        "-e", str(ERROR_RATE),      
+        "-1", str(READ_LENGTH),     
+        "-2", str(READ_LENGTH),     
+        "-N", str(required_read_pairs), 
+        input_path,                 
+        output_fastq_r1,            
+        output_fastq_r2             
+    ]
+    
+    print(f"Simulating reads for {genome_file}...")
+    
+    try:
+        # Run the command and capture output
+        result = subprocess.run(
+            wgsim_command, 
+            check=True, 
+            capture_output=True, 
+            text=True, 
+            env=os.environ
+        )
+        
+        print(f"WGSim STDOUT (Output):\n{result.stdout}")
+        print(f"WGSim STDERR (Warnings/Errors):\n{result.stderr}")
+        print(f"Simulation complete for {genome_file}. Files saved to {OUTPUT_DIR}/")
+            
+    except subprocess.CalledProcessError as e:
+        print(f"Error during wgsim execution for {genome_file}:")
+        print(e.stderr)
