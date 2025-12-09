@@ -1,0 +1,255 @@
+import random
+
+# --- Assignment Constants ---
+NUM_SNPS = 300
+NUM_INDELS = 20
+DNA_BASES = ['A', 'T', 'C', 'G']
+INDEL_SIZES = range(1, 11)
+
+# --- Utility Functions for Sequence and Mutation ---
+
+def get_random_base(exclude_base=None):
+    """Returns a random DNA base (A, T, C, G), optionally excluding a specified base."""
+    available_bases = [base for base in DNA_BASES if base != exclude_base]
+    if not available_bases:
+        return random.choice(DNA_BASES)
+    return random.choice(available_bases)
+
+def get_random_bases(count):
+    """Returns a list of 'count' random DNA bases."""
+    return [random.choice(DNA_BASES) for _ in range(count)]
+
+def read_genome_from_file(file_path):
+    """Reads a sequence from a FASTA or plain text file, stripping headers."""
+    sequence = []
+    try:
+        with open(file_path, 'r') as f: 
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('>'):
+                    sequence.append(line.upper())
+        return "".join(sequence)
+    except FileNotFoundError:
+        print(f"Error: File not found at {file_path}")
+        return None
+    except Exception as e:
+        print(f"An error occurred while reading the file: {e}")
+        return None
+    
+def initialize_genome_from_file(file_path):
+    """Reads the genome from a file and converts it to the mutation-tracking format."""
+    base_sequence = read_genome_from_file(file_path)
+    if base_sequence is None:
+        return None
+    # print for feedback on file loading
+    master_list = [[base, None, None] for base in base_sequence]
+    print(f"Genome initialized with length {len(master_list)}.")
+    #print for feedback on length
+    return master_list
+
+# --- Core Validation and Mutation Logic ---
+
+def can_replace_block(target_list, start_position, num_to_replace, verbose=False):
+    """Checks if a block of bases is available for mutation (i.e., not already mutated)."""
+    list_length = len(target_list)
+    if start_position < 0 or (start_position + num_to_replace) > list_length:
+        return False
+        
+    for i in range(num_to_replace):
+        current_position = start_position + i
+        try:
+            status = target_list[current_position][1]
+            if status in ('Deleted', 'Replaced', 'Indel_Anchor'):
+                return False
+        except (IndexError, TypeError):
+            return False
+            
+    return True
+
+def apply_snp(target_list, position):
+    """Applies a Single Nucleotide Polymorphism (SNP)."""
+    if not can_replace_block(target_list, position, 1):
+        return False
+        
+    original_base = target_list[position][0]
+    new_base = get_random_base(exclude_base=original_base) 
+    
+    target_list[position][1] = 'Replaced'
+    target_list[position][2] = new_base
+    return True
+
+def apply_insertion(target_list, start_position, length):
+    """Applies a small Insertion (modeled as an anchor replacement)."""
+    if not can_replace_block(target_list, start_position, 1):
+        return False
+
+    new_sequence = get_random_bases(length)
+    target_list[start_position][1] = 'Indel_Anchor' 
+    target_list[start_position][2] = new_sequence
+    return True
+
+def apply_deletion(target_list, start_position, length):
+    """Applies a small Deletion by marking a block as 'Deleted'."""
+    if not can_replace_block(target_list, start_position, length):
+        return False
+        
+    for i in range(length):
+        position = start_position + i
+        target_list[position][1] = 'Deleted'
+    return True
+
+def perform_random_mutations(genome, num_snps, num_indels):
+    """Applies the required number of random SNPs and Indels to the genome."""
+    genome_length = len(genome)
+    
+    snps_applied = 0
+    attempts = 0
+    while snps_applied < num_snps and attempts < num_snps * 5:
+        position = random.randrange(genome_length)
+        if apply_snp(genome, position):
+            snps_applied += 1
+        attempts += 1
+
+    indels_applied = 0
+    attempts = 0
+    while indels_applied < num_indels and attempts < num_indels * 5:
+        position = random.randrange(genome_length)
+        length = random.choice(INDEL_SIZES)
+        
+        if random.choice([True, False]):
+            if apply_deletion(genome, position, length):
+                indels_applied += 1
+        else:
+            if apply_insertion(genome, position, length):
+                indels_applied += 1
+        attempts += 1
+    return genome
+
+# --- Output and Reporting Functions  ---
+
+def save_fasta_file(sequence, file_path, header_line):
+    """
+    Saves a DNA sequence to a file in FASTA format.
+    The sequence is wrapped to 60 characters per line.
+    """
+    try:
+        with open(file_path, 'w') as f:
+            # 1. Write the FASTA header
+            f.write(header_line + '\n')
+            
+            # 2. Write the sequence, wrapped at 60 bases per line
+            # This makes the file readable and adheres to standard FASTA format
+            for i in range(0, len(sequence), 60):
+                f.write(sequence[i:i+60] + '\n')
+        
+        print(f"  Saved mutated genome to: {file_path}")
+        
+    except Exception as e:
+        print(f"  ERROR saving file {file_path}: {e}")
+
+def get_sequence(master_list, version='Mutated'):
+    """Constructs either the 'Original' or 'Mutated' linear genome sequence."""
+    sequence = []
+    for item in master_list:
+        status = item[1]
+        
+        if version == 'Original' or status is None:
+            sequence.append(item[0])
+            continue
+        
+        if status == 'Deleted':
+            continue
+        elif status == 'Replaced':
+            sequence.append(item[2])
+        elif status == 'Indel_Anchor':
+            sequence.extend(item[2])
+        else:
+            sequence.append(item[0])
+            
+    return "".join(sequence)
+
+def print_mutation_report(master_list, genome_label):
+    """Prints a formatted table of all applied mutations (SNPs and Indels)."""
+    
+    print(f"\n\n--- 📜 Mutation Report: {genome_label} ---")
+    print(f"{'Position':<10}{'Original Base':<15}{'Change Type':<15}{'Mutated Sequence/Base':<25}")
+    print(f"{'-'*10:<10}{'-'*15:<15}{'-'*15:<15}{'-'*25:<25}")
+
+    mutation_count = 0
+    
+    for i, item in enumerate(master_list):
+        position = i + 1
+        original_base = item[0]
+        status = item[1]
+        new_value = item[2]
+
+        if status is not None:
+            mutation_count += 1
+            
+            if status == 'Replaced':
+                mutated_sequence = str(new_value)
+            elif status == 'Deleted':
+                mutated_sequence = f"DEL ({original_base})" 
+            elif status == 'Indel_Anchor':
+                mutated_sequence = f"INS ({len(new_value)} bp): {''.join(new_value)}"
+            else:
+                mutated_sequence = 'ERROR'
+
+            print(f"{position:<10}{original_base:<15}{status:<15}{mutated_sequence:<25}")
+            
+    print(f"\nTotal mutations found and reported: {mutation_count}")
+    # Added a line break for separation
+    print("--------------------------------------------------")
+
+
+# Define the paths to genome files
+GENOME_FILE_1 = "EcoliK12-MG1655.fasta" 
+GENOME_FILE_2 = "NC_037282.1.fasta"
+
+# Define the output files
+OUTPUT_FILE_1 = "Mutated_EcoliK12.fasta"
+OUTPUT_FILE_2 = "Mutated_NC_037282.fasta"
+
+final_sequence_1 = None
+final_sequence_2 = None
+
+# 1. Genome 1 Processing
+print("\n=== STARTING GENOME 1 ===")
+genome1_master_list = initialize_genome_from_file(GENOME_FILE_1)
+
+# Ensure the list is not None before proceeding
+if genome1_master_list: 
+    original_sequence_1 = get_sequence(genome1_master_list, version='Original')
+
+    mutated_genome1_master_list = perform_random_mutations(
+        genome1_master_list, NUM_SNPS, NUM_INDELS
+    )
+    final_sequence_1 = get_sequence(mutated_genome1_master_list, version='Mutated') 
+    
+    save_fasta_file(
+        final_sequence_1, 
+        OUTPUT_FILE_1, 
+        ">Mutated_Genome_1_EcoliK12 | Mutations Applied"
+    )
+    print_mutation_report(mutated_genome1_master_list, "Genome 1") 
+
+    
+# ---
+# 2. Genome 2 Processing
+print("\n\n=== STARTING GENOME 2 ===")
+genome2_master_list = initialize_genome_from_file(GENOME_FILE_2)
+
+# Ensure the list is not None before proceeding
+if genome2_master_list:
+    original_sequence_2 = get_sequence(genome2_master_list, version='Original')
+
+    mutated_genome2_master_list = perform_random_mutations(
+        genome2_master_list, NUM_SNPS, NUM_INDELS
+    )
+    final_sequence_2 = get_sequence(mutated_genome2_master_list, version='Mutated')
+    save_fasta_file(
+        final_sequence_2, 
+        OUTPUT_FILE_2, 
+        ">Mutated_Genome_2_NC_037282 | Mutations Applied"
+    )
+    print_mutation_report(mutated_genome2_master_list, "Genome 2")
