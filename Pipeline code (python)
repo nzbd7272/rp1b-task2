@@ -1,0 +1,217 @@
+import subprocess
+import os
+import sys
+
+# --- Configuration  ---
+REF_FASTA = "NC_037282.1.fasta"
+# Assuming files are in the 'simulated_reads/' directory and are .fastq (not .fastq.gz)
+READS_DIR = "simulated_reads/"
+READS_R1 = f"{READS_DIR}Mutated_NC_037282_R1.fastq"
+READS_R2 = f"{READS_DIR}Mutated_NC_037282_R2.fastq"
+
+OUTPUT_BAM = "mapped_reads.bam"
+BCFTOOLS_VCF = "bcftools_variants.vcf"
+SNIPPY_DIR = "snippy_output"
+SNIPPY_VCF = f"{SNIPPY_DIR}/snps.vcf"
+
+# Output files for the merging steps
+MERGED_VCF_UNSCORED = "combined_unscored.vcf"
+FINAL_VCF_SCORED = "final_scored.vcf"
+CONDA_ENV_NAME = "varcall"
+# --- End Configuration ---
+
+
+def run_command(command, description):
+    """
+    Utility function to execute a shell command inside the Conda environment 
+    to ensure tools are found, and handles errors.
+    """
+    print(f"\n--- Starting: {description} ---")
+    
+    # wrap the command in 'conda run' to ensure the correct executables are found
+    full_command = f"conda run --name {CONDA_ENV_NAME} /bin/bash -c '{command}'"
+    
+    print(f"Full Command: {full_command}")
+    
+    try:
+        # shell=True is needed to execute the string containing pipes/redirections
+        subprocess.run(full_command, check=True, shell=True, capture_output=True, text=True) 
+        print(f"--- SUCCESS: {description} completed. ---")
+    except subprocess.CalledProcessError as e:
+        print(f"\nFATAL ERROR: {description} failed!")
+        print(f"Return Code: {e.returncode}")
+        print("Stopping pipeline.")
+        # Print the command output to help debug external tool errors
+        print(f"Command STDOUT:\n{e.stdout}")
+        print(f"Command STDERR:\n{e.stderr}")
+        sys.exit(1)
+
+
+def normalize_and_merge():
+    """
+    Assignment Step 3A: Normalizes and merges the two VCF files using bcftools.
+    
+    CRITICAL: This function now ensures ALL VCFs used in 'bcftools merge' are 
+    compressed with bgzip and indexed with tabix.
+    """
+    print("\n--- Starting Assignment Step 3A: VCF Normalization and Merging ---")
+
+    # 1. Normalize VCFs
+    
+    # STEP 1.1: BCFTOOLS NORM
+    run_command(
+        f"bcftools norm -f {REF_FASTA} -o bcf_norm.vcf {BCFTOOLS_VCF}", 
+        "Normalize bcftools VCF"
+    )
+    # Compress and Index normalized bcftools VCF for merging
+    run_command(
+        f"bgzip -f bcf_norm.vcf && tabix -f -p vcf bcf_norm.vcf.gz", 
+        "Compress and Index normalized bcftools VCF"
+    )
+    
+    # STEP 1.2: SNIPPY/FREEBAYES NORM (had some issues getting snippy to work so had to use Freebayes)
+    # Compress and Index the raw freebayes VCF (input to bcftools norm)
+    run_command(
+        f"bgzip -f {SNIPPY_VCF} && tabix -f -p vcf {SNIPPY_VCF}.gz", 
+        "Compress and Index raw freebayes VCF"
+    )
+    # Normalize the indexed VCF (Outputs uncompressed VCF: snippy_norm.vcf)
+    run_command(
+        f"bcftools norm -f {REF_FASTA} -o snippy_norm.vcf {SNIPPY_VCF}.gz", 
+        "Normalize Snippy VCF"
+    )
+    
+    # Compress and Index the second normalized VCF for merging
+    run_command(
+        f"bgzip -f snippy_norm.vcf && tabix -f -p vcf snippy_norm.vcf.gz", 
+        "Compress and Index normalized Snippy VCF"
+    )
+    
+    # 2. Merge Normalized VCFs
+    # Both input files must now be explicitly called with the .gz extension
+    run_command(
+        f"bcftools merge -m all bcf_norm.vcf.gz snippy_norm.vcf.gz -o {MERGED_VCF_UNSCORED}", 
+        "Merge VCFs"
+    )
+    print(f"Merged VCF created: {MERGED_VCF_UNSCORED}")
+
+
+def assign_trust_scores():
+    """
+    Assignment Step 3B: Assigns a custom trust score based on caller consensus.
+    """
+    print("\n--- Starting Assignment Step 3B: Custom Trust Score Assignment ---")
+    
+    # Define a new INFO field for the trust score (CS) in the VCF header
+    new_header_line = '##INFO=<ID=CS,Number=1,Type=Integer,Description="Consensus Score (1=Single Caller, 2=Both Callers)">'
+    
+    try:
+        with open(MERGED_VCF_UNSCORED, 'r') as infile, open(FINAL_VCF_SCORED, 'w') as outfile:
+            # These positional indices rely on the VCF structure after bcftools merge
+            SAMPLE1_IDX = -2 
+            SAMPLE2_IDX = -1 
+            
+            header_written = False
+
+            for line in infile:
+                if line.startswith('##'):
+                    outfile.write(line)
+                    if line.startswith('##INFO=') and not header_written:
+                        outfile.write(new_header_line + '\n')
+                        header_written = True
+                        
+                elif line.startswith('#CHROM'):
+                    outfile.write(line)
+                    
+                else:
+                    # Process the variant data line
+                    parts = line.strip().split('\t')
+                    
+                    if len(parts) < abs(SAMPLE1_IDX):
+                        continue
+                        
+                    # Extract Genotype (GT) field only (first part before ':')
+                    gt1 = parts[SAMPLE1_IDX].split(':')[0]
+                    gt2 = parts[SAMPLE2_IDX].split(':')[0]
+                    
+                    # Determine presence: GT is a variant if not Reference (0/0) or Missing (.)
+                    is_called_s1 = gt1 != '0/0' and gt1 != '.'
+                    is_called_s2 = gt2 != '0/0' and gt2 != '.'
+                    
+                    consensus_score = 0
+                    if is_called_s1: consensus_score += 1
+                    if is_called_s2: consensus_score += 1
+                        
+                    # Add the new INFO field (CS) to the INFO column (parts[7])
+                    new_info = f"{parts[7]};CS={consensus_score}"
+                    parts[7] = new_info
+                    
+                    outfile.write('\t'.join(parts) + '\n')
+                    
+        print(f"--- SUCCESS: Trust scores assigned. Scored VCF: {FINAL_VCF_SCORED} ---")
+        
+    except FileNotFoundError:
+        print(f"\nERROR: Could not find input file {MERGED_VCF_UNSCORED}. Check previous step.")
+        sys.exit(1)
+
+
+def main():
+    """
+    Main function to run the full bioinformatics pipeline.
+    """
+    print(" Starting Python-Orchestrated Variant Discovery Pipeline...")
+    
+    # Check for required input files
+    if not (os.path.exists(REF_FASTA) and os.path.exists(READS_R1) and os.path.exists(READS_R2)):
+        print("\nERROR: One or more input files are missing!")
+        print(f"Check if {REF_FASTA}, {READS_R1}, and {READS_R2} exist.")
+        sys.exit(1)
+
+    # --- Step 1: Prepare Reference Genome ---
+    run_command(f"bwa index {REF_FASTA}", "BWA Indexing")
+    run_command(f"samtools faidx {REF_FASTA}", "Samtools Faidx Indexing")
+    
+    # --- Step 2: Read Mapping (BWA-MEM & Samtools) ---
+    mapping_command = (
+        f"bwa mem -M {REF_FASTA} {READS_R1} {READS_R2} | "
+        f"samtools view -@ 4 -Sb - | "
+        f"samtools sort -@ 4 -o {OUTPUT_BAM} - "
+    )
+    run_command(mapping_command, "BWA-MEM Mapping and Sorting")
+    run_command(f"samtools index {OUTPUT_BAM}", "Samtools BAM Indexing")
+    
+    # --- Step 3: Variant Calling (bcftools) ---
+    bcftools_command = (
+        f"bcftools mpileup -Ou -f {REF_FASTA} {OUTPUT_BAM} | "
+        f"bcftools call -mv -Ov -o {BCFTOOLS_VCF}"
+    )
+    run_command(bcftools_command, "bcftools Variant Calling")
+    
+    # --- Step 4: Variant Calling (Manual freebayes) ---
+    print("\n--- Starting Step 4: Manual freebayes Variant Calling (Bypassing Snippy) ---")
+    
+    # Create the snippy output directory since Snippy isn't doing it
+    if not os.path.exists(SNIPPY_DIR):
+        os.makedirs(SNIPPY_DIR)
+        
+    freebayes_command = (
+        f"freebayes -f {REF_FASTA} {OUTPUT_BAM} "
+        f"-v {SNIPPY_VCF} "
+        f"--min-alternate-fraction 0.9 --min-coverage 10" 
+    )
+    
+    run_command(
+        freebayes_command,
+        "freebayes Variant Calling for Snippy Output"
+    )
+
+    # --- Assignment Step 3: Combine and Score ---
+    normalize_and_merge()
+    assign_trust_scores()
+    
+    print("\n--- FULL PIPELINE COMPLETE ---")
+    print(f"The final scored VCF is: {FINAL_VCF_SCORED}")
+
+
+if __name__ == "__main__":
+    main()
